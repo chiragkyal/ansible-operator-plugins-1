@@ -15,19 +15,19 @@
 package ansible
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/kubebuilder/v4/pkg/cli"
 
 	"github.com/operator-framework/ansible-operator-plugins/hack/generate/samples/internal/pkg"
-	ansiblecli "github.com/operator-framework/ansible-operator-plugins/internal/cmd/ansible-cli/cli"
 	"github.com/operator-framework/ansible-operator-plugins/pkg/testutils/command"
 	"github.com/operator-framework/ansible-operator-plugins/pkg/testutils/e2e"
 	"github.com/operator-framework/ansible-operator-plugins/pkg/testutils/sample"
-	samplecli "github.com/operator-framework/ansible-operator-plugins/pkg/testutils/sample/cli"
 )
 
 const bundleImage = "quay.io/example/memcached-operator:v0.0.1"
@@ -38,187 +38,178 @@ var memcachedGVK = schema.GroupVersionKind{
 	Kind:    "Memcached",
 }
 
-func getCli() *cli.CLI {
-	return ansiblecli.GetPluginsCLI()
+// ExecSample implements sample.Sample by invoking the external ansible-cli binary.
+type ExecSample struct {
+	baseDir        string
+	name           string
+	domain         string
+	plugins        []string
+	gvks           []schema.GroupVersionKind
+	initOptions    []string
+	apiOptions     []string
+	webhookOptions []string
+	binary         string
+	env            []string
 }
 
+func (s *ExecSample) CommandContext() command.CommandContext {
+	// Used for post-generation cleanup and file operations
+	return command.NewGenericCommandContext()
+}
+
+func (s *ExecSample) Name() string                    { return s.name }
+func (s *ExecSample) Domain() string                  { return s.domain }
+func (s *ExecSample) GVKs() []schema.GroupVersionKind { return s.gvks }
+func (s *ExecSample) Dir() string                     { return filepath.Join(s.baseDir, s.name) }
+func (s *ExecSample) Binary() string                  { return s.binary }
+
+func (s *ExecSample) GenerateInit() error {
+	dir := s.Dir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("error creating directory %s: %w", dir, err)
+	}
+	args := []string{"init", "--plugins", strings.Join(s.plugins, ","), "--domain", s.domain}
+	args = append(args, s.initOptions...)
+	cmd := exec.Command(s.binary, args...)
+	cmd.Env = append(os.Environ(), s.env...)
+	cmd.Dir = dir
+	fmt.Println("Running command:", strings.Join(cmd.Args, " "))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("error running %v: %w\n%s", cmd.Args, err, string(output))
+	}
+	return nil
+}
+
+func (s *ExecSample) GenerateApi() error {
+	dir := s.Dir()
+	for _, gvk := range s.gvks {
+		args := []string{"create", "api", "--plugins", strings.Join(s.plugins, ","), "--group", gvk.Group, "--version", gvk.Version, "--kind", gvk.Kind}
+		args = append(args, s.apiOptions...)
+		cmd := exec.Command(s.binary, args...)
+		cmd.Env = append(os.Environ(), s.env...)
+		cmd.Dir = dir
+		fmt.Println("Running command:", strings.Join(cmd.Args, " "))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("error running %v: %w\n%s", cmd.Args, err, string(output))
+		}
+	}
+	return nil
+}
+
+func (s *ExecSample) GenerateWebhook() error {
+	dir := s.Dir()
+	for _, gvk := range s.gvks {
+		args := []string{"create", "webhook", "--plugins", strings.Join(s.plugins, ","), "--group", gvk.Group, "--version", gvk.Version, "--kind", gvk.Kind}
+		args = append(args, s.webhookOptions...)
+		cmd := exec.Command(s.binary, args...)
+		cmd.Env = append(os.Environ(), s.env...)
+		cmd.Dir = dir
+		fmt.Println("Running command:", strings.Join(cmd.Args, " "))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("error running %v: %w\n%s", cmd.Args, err, string(output))
+		}
+	}
+	return nil
+}
+
+// GenerateMemcachedSamples scaffolds a Memcached operator using the local ansible-cli binary.
 func GenerateMemcachedSamples(rootPath string) []sample.Sample {
-	ansibleCC := command.NewGenericCommandContext(
-		command.WithEnv("GO111MODULE=on"),
-		command.WithDir(filepath.Join(rootPath, "ansible")),
-	)
-
-	ansibleMemcached, err := samplecli.NewCliSample(
-		samplecli.WithCLI(getCli()),
-		samplecli.WithCommandContext(ansibleCC),
-		samplecli.WithDomain("example.com"),
-		samplecli.WithGvk(memcachedGVK),
-		samplecli.WithPlugins("ansible"),
-		samplecli.WithExtraApiOptions("--generate-role", "--generate-playbook"),
-		samplecli.WithName("memcached-operator"),
-	)
-	pkg.CheckError("attempting to create sample cli", err)
-
-	// remove sample directory if it already exists
-	err = os.RemoveAll(ansibleMemcached.Dir())
-	pkg.CheckError("attempting to remove sample dir", err)
-
-	gen := sample.NewGenerator(
-		sample.WithNoWebhook(),
-	)
-
-	err = gen.GenerateSamples(ansibleMemcached)
-	pkg.CheckError("generating ansible samples", err)
-
-	ImplementMemcached(ansibleMemcached, bundleImage)
-	return []sample.Sample{ansibleMemcached}
+	samplesPath := filepath.Join(rootPath, "ansible")
+	s := &ExecSample{
+		baseDir:     samplesPath,
+		name:        "memcached-operator",
+		domain:      "example.com",
+		plugins:     []string{"ansible"},
+		gvks:        []schema.GroupVersionKind{memcachedGVK},
+		initOptions: []string{},
+		apiOptions:  []string{"--generate-role", "--generate-playbook"},
+		binary:      "ansible-cli",
+		env:         []string{"GO111MODULE=on"},
+	}
+	pkg.CheckError("attempting to remove sample dir", os.RemoveAll(s.Dir()))
+	gen := sample.NewGenerator(sample.WithNoWebhook())
+	pkg.CheckError("generating ansible samples", gen.GenerateSamples(s))
+	ImplementMemcached(s, bundleImage)
+	return []sample.Sample{s}
 }
 
-// GenerateMoleculeSample will call all actions to create the directory and generate the sample
-// The Context to run the samples are not the same in the e2e test. In this way, note that it should NOT
-// be called in the e2e tests since it will call the Prepare() to set the sample context and generate the files
-// in the testdata directory. The e2e tests only ought to use the Run() method with the TestContext.
+// GenerateMoleculeSample scaffolds a multi-CR sample using the local ansible-cli binary.
 func GenerateMoleculeSample(samplesPath string) []sample.Sample {
-	ansibleCC := command.NewGenericCommandContext(
-		command.WithEnv("GO111MODULE=on"),
-		command.WithDir(filepath.Join(samplesPath, "")),
-	)
-
-	ansibleMoleculeMemcached, err := samplecli.NewCliSample(
-		samplecli.WithCLI(getCli()),
-		samplecli.WithCommandContext(ansibleCC),
-		samplecli.WithDomain("example.com"),
-		samplecli.WithGvk(
+	s := &ExecSample{
+		baseDir: samplesPath,
+		name:    "memcached-molecule-operator",
+		domain:  "example.com",
+		plugins: []string{"ansible"},
+		gvks: []schema.GroupVersionKind{
 			memcachedGVK,
-			schema.GroupVersionKind{
-				Group:   memcachedGVK.Group,
-				Version: memcachedGVK.Version,
-				Kind:    "Foo",
-			},
-			schema.GroupVersionKind{
-				Group:   memcachedGVK.Group,
-				Version: memcachedGVK.Version,
-				Kind:    "Memfin",
-			},
-		),
-		samplecli.WithPlugins("ansible"),
-		samplecli.WithExtraApiOptions("--generate-role", "--generate-playbook"),
-		samplecli.WithName("memcached-molecule-operator"),
-	)
-	pkg.CheckError("attempting to create sample cli", err)
-
-	addIgnore, err := samplecli.NewCliSample(
-		samplecli.WithCLI(getCli()),
-		samplecli.WithCommandContext(ansibleMoleculeMemcached.CommandContext()),
-		samplecli.WithGvk(
-			schema.GroupVersionKind{
-				Group:   "ignore",
-				Version: "v1",
-				Kind:    "Secret",
-			},
-		),
-		samplecli.WithPlugins("ansible"),
-		samplecli.WithExtraApiOptions("--generate-role"),
-		samplecli.WithName(ansibleMoleculeMemcached.Name()),
-	)
-	pkg.CheckError("creating ignore samples", err)
-
-	// remove sample directory if it already exists
-	err = os.RemoveAll(ansibleMoleculeMemcached.Dir())
-	pkg.CheckError("attempting to remove sample dir", err)
-
-	gen := sample.NewGenerator(
-		sample.WithNoWebhook(),
-	)
-
-	err = gen.GenerateSamples(ansibleMoleculeMemcached)
-	pkg.CheckError("generating ansible molecule sample", err)
-
+			{Group: memcachedGVK.Group, Version: memcachedGVK.Version, Kind: "Foo"},
+			{Group: memcachedGVK.Group, Version: memcachedGVK.Version, Kind: "Memfin"},
+		},
+		initOptions: []string{},
+		apiOptions:  []string{"--generate-role", "--generate-playbook"},
+		binary:      "ansible-cli",
+		env:         []string{"GO111MODULE=on"},
+	}
+	ignore := &ExecSample{
+		baseDir:     samplesPath,
+		name:        s.name,
+		domain:      s.domain,
+		plugins:     []string{"ansible"},
+		gvks:        []schema.GroupVersionKind{{Group: "ignore", Version: "v1", Kind: "Secret"}},
+		initOptions: []string{},
+		apiOptions:  []string{"--generate-role"},
+		binary:      "ansible-cli",
+		env:         []string{"GO111MODULE=on"},
+	}
+	pkg.CheckError("attempting to remove sample dir", os.RemoveAll(s.Dir()))
+	gen := sample.NewGenerator(sample.WithNoWebhook())
+	pkg.CheckError("generating ansible molecule sample", gen.GenerateSamples(s))
 	log.Infof("enabling multigroup support")
-	err = e2e.AllowProjectBeMultiGroup(ansibleMoleculeMemcached)
-	pkg.CheckError("updating PROJECT file", err)
-
+	pkg.CheckError("updating PROJECT file", e2e.AllowProjectBeMultiGroup(s))
 	ignoreGen := sample.NewGenerator(sample.WithNoInit(), sample.WithNoWebhook())
-	err = ignoreGen.GenerateSamples(addIgnore)
-	pkg.CheckError("generating ansible molecule sample - ignore", err)
-
-	ImplementMemcached(ansibleMoleculeMemcached, bundleImage)
-
-	ImplementMemcachedMolecule(ansibleMoleculeMemcached, bundleImage)
-	return []sample.Sample{ansibleMoleculeMemcached}
+	pkg.CheckError("generating ansible molecule sample - ignore", ignoreGen.GenerateSamples(ignore))
+	ImplementMemcached(s, bundleImage)
+	ImplementMemcachedMolecule(s, bundleImage)
+	return []sample.Sample{s}
 }
 
-// GenerateAdvancedMoleculeSample will call all actions to create the directory and generate the sample
-// The Context to run the samples are not the same in the e2e test. In this way, note that it should NOT
-// be called in the e2e tests since it will call the Prepare() to set the sample context and generate the files
-// in the testdata directory. The e2e tests only ought to use the Run() method with the TestContext.
+// GenerateAdvancedMoleculeSample scaffolds an advanced multi-CR sample using the local ansible-cli binary.
 func GenerateAdvancedMoleculeSample(samplesPath string) {
-	ansibleCC := command.NewGenericCommandContext(
-		command.WithEnv("GO111MODULE=on"),
-		command.WithDir(filepath.Join(samplesPath, "")),
-	)
-
-	gv := schema.GroupVersion{
-		Group:   "test",
-		Version: "v1alpha1",
-	}
-
-	kinds := []string{
-		"ArgsTest",
-		"CaseTest",
-		"CollectionTest",
-		"ClusterAnnotationTest",
-		"FinalizerConcurrencyTest",
-		"ReconciliationTest",
-		"SelectorTest",
-		"SubresourcesTest",
-	}
-
+	gv := schema.GroupVersion{Group: "test", Version: "v1alpha1"}
+	kinds := []string{"ArgsTest", "CaseTest", "CollectionTest", "ClusterAnnotationTest", "FinalizerConcurrencyTest", "ReconciliationTest", "SelectorTest", "SubresourcesTest"}
 	var gvks []schema.GroupVersionKind
-
 	for _, kind := range kinds {
 		gvks = append(gvks, schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: kind})
 	}
-
-	advancedMoleculeMemcached, err := samplecli.NewCliSample(
-		samplecli.WithCLI(getCli()),
-		samplecli.WithCommandContext(ansibleCC),
-		samplecli.WithDomain("example.com"),
-		samplecli.WithGvk(gvks...),
-		samplecli.WithPlugins("ansible"),
-		samplecli.WithExtraApiOptions("--generate-playbook"),
-		samplecli.WithName("advanced-molecule-operator"),
-	)
-	pkg.CheckError("attempting to create sample cli", err)
-
-	addInventory, err := samplecli.NewCliSample(
-		samplecli.WithCLI(getCli()),
-		samplecli.WithCommandContext(advancedMoleculeMemcached.CommandContext()),
-		samplecli.WithGvk(
-			schema.GroupVersionKind{
-				Group:   gv.Group,
-				Version: gv.Version,
-				Kind:    "InventoryTest",
-			},
-		),
-		samplecli.WithPlugins("ansible"),
-		samplecli.WithExtraApiOptions("--generate-role", "--generate-playbook"),
-		samplecli.WithName(advancedMoleculeMemcached.Name()),
-	)
-	pkg.CheckError("creating inventory samples", err)
-
-	// remove sample directory if it already exists
-	err = os.RemoveAll(advancedMoleculeMemcached.Dir())
-	pkg.CheckError("attempting to remove sample dir", err)
-
+	s := &ExecSample{
+		baseDir:     samplesPath,
+		name:        "advanced-molecule-operator",
+		domain:      "example.com",
+		plugins:     []string{"ansible"},
+		gvks:        gvks,
+		initOptions: []string{},
+		apiOptions:  []string{"--generate-playbook"},
+		binary:      "ansible-cli",
+		env:         []string{"GO111MODULE=on"},
+	}
+	inventory := &ExecSample{
+		baseDir:     samplesPath,
+		name:        s.name,
+		domain:      s.domain,
+		plugins:     []string{"ansible"},
+		gvks:        []schema.GroupVersionKind{{Group: gv.Group, Version: gv.Version, Kind: "InventoryTest"}},
+		initOptions: []string{},
+		apiOptions:  []string{"--generate-role", "--generate-playbook"},
+		binary:      "ansible-cli",
+		env:         []string{"GO111MODULE=on"},
+	}
+	pkg.CheckError("attempting to remove sample dir", os.RemoveAll(s.Dir()))
 	gen := sample.NewGenerator(sample.WithNoWebhook())
-
-	err = gen.GenerateSamples(advancedMoleculeMemcached)
-	pkg.CheckError("generating ansible advanced molecule sample", err)
-
+	pkg.CheckError("generating ansible advanced molecule sample", gen.GenerateSamples(s))
 	ignoreGen := sample.NewGenerator(sample.WithNoInit(), sample.WithNoWebhook())
-	err = ignoreGen.GenerateSamples(addInventory)
-	pkg.CheckError("generating ansible molecule sample - ignore", err)
-
-	ImplementAdvancedMolecule(advancedMoleculeMemcached, bundleImage)
+	pkg.CheckError("generating ansible molecule sample - ignore", ignoreGen.GenerateSamples(inventory))
+	ImplementAdvancedMolecule(s, bundleImage)
 }
