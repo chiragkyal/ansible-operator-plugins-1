@@ -37,6 +37,38 @@ import (
 
 var log = logf.Log.WithName("runner")
 
+// Common interface for both HTTP and file-based event receivers
+type eventReceiver interface {
+	Events() <-chan eventapi.JobEvent
+	Close()
+}
+
+// httpReceiverWrapper wraps the HTTP-based EventReceiver
+type httpReceiverWrapper struct {
+	receiver *eventapi.EventReceiver
+}
+
+func (w *httpReceiverWrapper) Events() <-chan eventapi.JobEvent {
+	return w.receiver.Events
+}
+
+func (w *httpReceiverWrapper) Close() {
+	w.receiver.Close()
+}
+
+// fileReceiverWrapper wraps the file-based EventReceiver
+type fileReceiverWrapper struct {
+	receiver *eventapi.FileEventReceiver
+}
+
+func (w *fileReceiverWrapper) Events() <-chan eventapi.JobEvent {
+	return w.receiver.Events
+}
+
+func (w *fileReceiverWrapper) Close() {
+	w.receiver.Close()
+}
+
 const (
 	// MaxRunnerArtifactsAnnotation - annotation used by a user to specify the max artifacts to keep
 	// in the runner directory. This will override the value provided by the watches file for a
@@ -199,10 +231,30 @@ func (r *runner) Run(ident string, u *unstructured.Unstructured, kubeconfig stri
 	// start the event receiver. We'll check errChan for an error after
 	// ansible-runner exits.
 	errChan := make(chan error, 1)
-	receiver, err := eventapi.New(ident, errChan)
-	if err != nil {
-		return nil, err
+
+	// Check if HTTP event API is disabled via environment variable
+	useFileAPI := os.Getenv("ANSIBLE_RUNNER_USE_FILE_API") == "true"
+
+	var receiver eventReceiver
+
+	if useFileAPI {
+		// Use file-based event API
+		fileReceiver, err := eventapi.NewFileEventReceiver(ident,
+			filepath.Join("/tmp/ansible-operator/runner/", r.GVK.Group, r.GVK.Version, r.GVK.Kind,
+				u.GetNamespace(), u.GetName()), errChan)
+		if err != nil {
+			return nil, err
+		}
+		receiver = &fileReceiverWrapper{fileReceiver}
+	} else {
+		// Use existing HTTP-based event API
+		httpReceiver, err := eventapi.New(ident, errChan)
+		if err != nil {
+			return nil, err
+		}
+		receiver = &httpReceiverWrapper{httpReceiver}
 	}
+
 	inputDir := inputdir.InputDir{
 		Path: filepath.Join("/tmp/ansible-operator/runner/", r.GVK.Group, r.GVK.Version, r.GVK.Kind,
 			u.GetNamespace(), u.GetName()),
@@ -211,11 +263,23 @@ func (r *runner) Run(ident string, u *unstructured.Unstructured, kubeconfig stri
 			"K8S_AUTH_KUBECONFIG": kubeconfig,
 			"KUBECONFIG":          kubeconfig,
 		},
-		Settings: map[string]string{
-			"runner_http_url":  receiver.SocketPath,
-			"runner_http_path": receiver.URLPath,
-		},
 		CmdLine: r.ansibleArgs,
+	}
+
+	// Configure Settings based on the API type
+	if useFileAPI {
+		// For file API, don't set HTTP settings - ansible-runner will use its default artifact output
+		inputDir.Settings = map[string]string{
+			// File-based mode relies on ansible-runner's default artifact output
+		}
+	} else {
+		// For HTTP API, set the existing HTTP settings
+		if httpWrapper, ok := receiver.(*httpReceiverWrapper); ok {
+			inputDir.Settings = map[string]string{
+				"runner_http_url":  httpWrapper.receiver.SocketPath,
+				"runner_http_path": httpWrapper.receiver.URLPath,
+			}
+		}
 	}
 	// If Path is a dir, assume it is a role path. Otherwise assume it's a
 	// playbook path
@@ -297,7 +361,7 @@ func (r *runner) Run(ident string, u *unstructured.Unstructured, kubeconfig stri
 	}()
 
 	return &runResult{
-		events:   receiver.Events,
+		events:   receiver.Events(),
 		inputDir: &inputDir,
 		ident:    ident,
 	}, nil
