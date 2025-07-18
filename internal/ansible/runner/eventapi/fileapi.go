@@ -15,14 +15,11 @@
 package eventapi
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -51,15 +48,6 @@ type FileEventReceiver struct {
 	// logger holds a logger that has some fields already set
 	logger logr.Logger
 
-	// watcher for file system events
-	watcher *fsnotify.Watcher
-
-	// processedEvents tracks which event files we've already processed
-	processedEvents map[string]bool
-
-	// current position in the stdout file
-	filePosition int64
-
 	// errChan is a channel for errors
 	errChan chan<- error
 
@@ -69,80 +57,19 @@ type FileEventReceiver struct {
 
 // NewFileEventReceiver creates a new file-based event receiver
 func NewFileEventReceiver(ident string, artifactPath string, errChan chan<- error) (*FileEventReceiver, error) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-
 	receiver := &FileEventReceiver{
-		Events:          make(chan JobEvent, 1000),
-		ArtifactPath:    artifactPath,
-		ident:           ident,
-		logger:          logf.Log.WithName("fileapi").WithValues("job", ident),
-		watcher:         watcher,
-		processedEvents: make(map[string]bool),
-		filePosition:    0,
-		errChan:         errChan,
-		ctx:             context.Background(), // Placeholder, will be updated
+		Events:       make(chan JobEvent, 1000),
+		ArtifactPath: artifactPath,
+		ident:        ident,
+		logger:       logf.Log.WithName("fileapi").WithValues("job", ident),
+		errChan:      errChan,
+		ctx:          context.Background(), // Placeholder, will be updated
 	}
-
-	// The watcher is not needed for the new job_events directory approach
-	// We'll create and watch the proper ansible-runner directory structure
 
 	// Start watching for file changes
 	go receiver.watchJobEvents()
 
 	return receiver, nil
-}
-
-// watchFiles monitors the artifact directory for new event files
-func (r *FileEventReceiver) watchFiles(errChan chan<- error) {
-	// Use a ticker to periodically scan for new events as primary mechanism
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case event, ok := <-r.watcher.Events:
-			if !ok {
-				errChan <- nil
-				return
-			}
-
-			r.mutex.RLock()
-			if r.stopped {
-				r.mutex.RUnlock()
-				errChan <- nil
-				return
-			}
-			r.mutex.RUnlock()
-
-			// React to file system events
-			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-				r.scanForEvents()
-			}
-
-		case <-ticker.C:
-			r.mutex.RLock()
-			if r.stopped {
-				r.mutex.RUnlock()
-				errChan <- nil
-				return
-			}
-			r.mutex.RUnlock()
-
-			// Primary mechanism: regularly scan for new events
-			r.scanForEvents()
-
-		case err, ok := <-r.watcher.Errors:
-			if !ok {
-				errChan <- nil
-				return
-			}
-			r.logger.Error(err, "Watcher error")
-			// Don't exit on watcher errors, continue with polling
-		}
-	}
 }
 
 // watchJobEvents monitors the job_events directory for new files
@@ -218,44 +145,6 @@ func (f *FileEventReceiver) processExistingFiles(jobEventsDir string) {
 	}
 }
 
-// scanForEvents scans both job_events directory and stdout file for new events
-func (r *FileEventReceiver) scanForEvents() {
-	// Process structured events from job_events directory
-	eventsDir := filepath.Join(r.ArtifactPath, "artifacts", r.ident, "job_events")
-	r.processJobEventsDir(eventsDir)
-
-	// Process stdout for additional context
-	stdoutFile := filepath.Join(r.ArtifactPath, "artifacts", r.ident, "stdout")
-	r.processStdoutFile(stdoutFile)
-}
-
-// processJobEventsDir scans the job_events directory for new event files
-func (r *FileEventReceiver) processJobEventsDir(eventsDir string) {
-	entries, err := os.ReadDir(eventsDir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			r.logger.V(2).Info("job_events directory not yet created", "dir", eventsDir)
-		}
-		return
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		// Skip if we've already processed this event file
-		eventFile := filepath.Join(eventsDir, entry.Name())
-		if r.processedEvents[eventFile] {
-			continue
-		}
-
-		if r.processEventFile(eventFile) {
-			r.processedEvents[eventFile] = true
-		}
-	}
-}
-
 // processEventFile reads and parses a single event file
 func (r *FileEventReceiver) processEventFile(filename string) bool {
 	file, err := os.Open(filename)
@@ -288,62 +177,6 @@ func (r *FileEventReceiver) processEventFile(filename string) bool {
 	}
 }
 
-// processStdoutFile processes stdout output for progress tracking
-func (r *FileEventReceiver) processStdoutFile(filename string) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return // Stdout file may not exist yet
-	}
-	defer file.Close()
-
-	// Get file size
-	stat, err := file.Stat()
-	if err != nil {
-		return
-	}
-
-	// If file is smaller than our position, reset (log was rotated/recreated)
-	if stat.Size() < r.filePosition {
-		r.filePosition = 0
-	}
-
-	// Seek to last known position
-	if _, err := file.Seek(r.filePosition, 0); err != nil {
-		return
-	}
-
-	reader := bufio.NewReader(file)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				// Update position and wait for more content
-				if pos, err := file.Seek(0, 1); err == nil {
-					r.filePosition = pos
-				}
-			}
-			break
-		}
-
-		r.filePosition += int64(len(line))
-
-		// Extract task information from stdout for additional context
-		r.processStdoutLine(strings.TrimSpace(line))
-	}
-}
-
-// processStdoutLine extracts useful information from stdout lines
-func (r *FileEventReceiver) processStdoutLine(line string) {
-	// Look for task start patterns in stdout
-	if strings.Contains(line, "TASK [") && strings.Contains(line, "]") {
-		r.logger.V(1).Info("Task progress", "line", line)
-	} else if strings.Contains(line, "PLAY [") {
-		r.logger.V(1).Info("Playbook progress", "line", line)
-	} else if strings.Contains(line, "PLAY RECAP") {
-		r.logger.V(1).Info("Playbook completed", "line", line)
-	}
-}
-
 // Close ensures that appropriate resources are cleaned up
 func (r *FileEventReceiver) Close() {
 	r.mutex.Lock()
@@ -351,10 +184,6 @@ func (r *FileEventReceiver) Close() {
 	r.mutex.Unlock()
 
 	r.logger.V(1).Info("File Event API stopped")
-
-	if r.watcher != nil {
-		r.watcher.Close()
-	}
 
 	close(r.Events)
 }
